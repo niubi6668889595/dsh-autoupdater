@@ -64,8 +64,23 @@ dsh plugin --profile web add github:<owner>/dsh-autoupdater
   ```
 
   未配置免密时 sudo 会失败，日志里如实记录，插件不会反复重试
-- 未探测到 systemd → 按原 argv 脱离子进程拉起（兜底）
+- 未探测到 systemd（含 macOS / Windows 桌面 App）→ 不做进程内重启，只把“待重启”写进本轮结果，下次启动生效
 - npm 全局安装后校验 dsh 二进制存在，缺失则**放弃重启**（防变砖）
+
+## 桌面 App（macOS / Windows）
+
+桌面版的 DSH 运行在 Electron 里，与 `dsh web` 的 Linux 进程模型不同，本插件做了三处适配：
+
+1. **插件换版**：桌面 App 的 `pluginManager` 会以 `already-installed` 拒绝替换 HMR 下的已装包，
+   普通 `dsh` CLI 又拒绝 `desktop` 保留 profile。插件改用安装包自带的
+   `dsh-desktop-host/lib/cli.js`（Electron `ELECTRON_RUN_AS_NODE=1`）执行
+   `dsh plugin --profile desktop add <pkg>@<ver>`——这是桌面版唯一允许写 desktop profile 的入口。
+2. **安装源**：换版命令默认先走 `registry.npmmirror.com`（与版本查询同一个源），失败再退回
+   pnpm 默认源，避免 `registry.npmjs.org` 在国内链路上长时间 `CONNECT_TIMEOUT`。
+3. **重启**：桌面 App 由 `electron-updater` 自己升级，插件不再检查/暂存 DSH 本体；插件换版后
+   只标记“重启后生效”，不会从进程内部 relaunch（那会连带杀掉正在跑的会话）。
+
+因此桌面版的工作方式是：**静默把插件换版到磁盘 → 面板提示重启 → 你下次打开 App 时生效**。
 
 ## 安全模型
 
@@ -77,7 +92,7 @@ dsh plugin --profile web add github:<owner>/dsh-autoupdater
 ## 已知限制
 
 - 插件更新只覆盖声明 `dsh.bundle` 的 npm 形态插件；GitHub 源码安装的插件版本比对不适用
-- 本体更新依赖 npm 全局安装形态（git checkout 形态请用 [dsh-updater](https://github.com/GodCC6/dsh-updater)）
+- 本体更新依赖 npm 全局安装形态（git checkout 形态请用 [dsh-updater](https://github.com/GodCC6/dsh-updater)；桌面 App 不参与本体更新，由 App 自带更新器负责）
 - 空闲判定基于本机 `$DSH_HOME/sessions` 的文件 mtime，远程会话（SSH 场景）不计入
 
 ## 致谢

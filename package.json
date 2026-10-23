@@ -1,6 +1,6 @@
 {
   "name": "dsh-autoupdater",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "type": "module",
   "license": "MIT",
   "description": "Scheduled update checks for DSH itself and installed plugins, applied only in idle windows. Four schedule modes, dual-direction whitelist, web settings panel under the plugin manager.",

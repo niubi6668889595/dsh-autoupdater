@@ -1,7 +1,7 @@
 import { readFile, writeFile, mkdir, appendFile } from 'node:fs/promises';
-import { readFileSync, readdirSync, statSync } from 'node:fs';
-import { existsSync } from 'node:fs';
-import { execSync } from 'node:child_process';
+import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
+import { execSync, spawn } from 'node:child_process';
+import { basename, delimiter, dirname, join } from 'node:path';
 
 /**
  * dsh-autoupdater — 定时检查 DSH 本体与已装 bundle 插件的更新。
@@ -130,6 +130,47 @@ async function readJson(path) {
   try { return JSON.parse(await readFile(path, 'utf8')); } catch { return null; }
 }
 
+/** 运行子进程并收集 stdout+stderr；超时或无法启动 → code -1。 */
+function spawnCapture(command, args, { env = process.env, timeoutMs = 300000 } = {}) {
+  return new Promise((resolve) => {
+    let output = '';
+    let settled = false;
+    let child;
+    const finish = (code) => {
+      if (settled) return;
+      settled = true;
+      resolve({ code, output });
+    };
+    try {
+      child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], env });
+    } catch (e) {
+      output += String(e?.message ?? e);
+      finish(-1);
+      return;
+    }
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch {}
+      output += `\n[dsh-autoupdater] timeout after ${timeoutMs}ms`;
+      finish(-1);
+    }, timeoutMs);
+    child.stdout?.on('data', (d) => { output += d; });
+    child.stderr?.on('data', (d) => { output += d; });
+    child.on('close', (c) => { clearTimeout(timer); finish(c); });
+    child.on('error', (e) => { clearTimeout(timer); output += `\n${e?.message ?? e}`; finish(-1); });
+  });
+}
+
+/** 从命令输出里挑一条最能说明失败原因的行（优先 ERROR 类关键词）。 */
+function lastMeaningfulLine(text, limit = 220) {
+  const lines = String(text ?? '')
+    .split('\n')
+    .map((line) => line.replace(/\u001b\[[0-9;]*m/g, '').trim())
+    .filter(Boolean);
+  if (lines.length === 0) return '';
+  const errorLike = [...lines].reverse().find((line) => /ERR_|ERROR|\berror\b|fatal:|Cannot|failed|not found|E[A-Z]{4,}/i.test(line));
+  return (errorLike ?? lines[lines.length - 1]).slice(0, limit);
+}
+
 // ─────────────────────────── 主插件 ───────────────────────────
 
 export const inject = ['agents', 'pluginManager', 'webServer'];
@@ -171,6 +212,46 @@ export function apply(ctx, rawConfig = {}) {
     }
     if (profileDir && config.verbose) log('profileDir detected:', profileDir);
   } catch {}
+
+  /** 是否运行在 Electron 桌面 App 的进程里（macOS/Windows 安装包）。 */
+  const isDesktopApp = () => typeof process.versions?.electron === 'string';
+
+  /**
+   * 找一条能真正写 profile 的 `dsh plugin` 入口。
+   *
+   * 桌面 App 有两条特殊约束，也是“更新永远 failed”的根因：
+   *  1. process.execPath 是 Electron 可执行文件，同目录没有 `dsh`（Linux npm 全局安装的布局）；
+   *  2. 即使找到普通 `dsh`，它也会以
+   *     `profile "desktop" is managed exclusively by the Electron application` 拒绝 desktop 保留 profile。
+   * 安装包自带 dsh-desktop-host/lib/cli.js，它以 manageDesktopProfile=true 调 runCli，
+   * 是桌面版唯一官方允许写 desktop profile 的入口。
+   */
+  function resolvePluginCli() {
+    if (isDesktopApp() && process.resourcesPath) {
+      const desktopCli = join(process.resourcesPath, 'app.asar', 'dsh', 'node_modules',
+        '@deepseek-ai', 'dsh-desktop-host', 'lib', 'cli.js');
+      if (existsSync(desktopCli)) {
+        return {
+          command: process.execPath,
+          prefixArgs: [desktopCli],
+          env: { ELECTRON_RUN_AS_NODE: '1' },
+          label: 'desktop-cli',
+        };
+      }
+      log('desktop CLI not found at', desktopCli);
+    }
+    // 普通 npm 全局安装：dsh 与 node 同目录（Linux 常见布局）
+    const sibling = join(dirname(process.execPath), process.platform === 'win32' ? 'dsh.cmd' : 'dsh');
+    if (existsSync(sibling)) return { command: sibling, prefixArgs: [], env: {}, label: 'sibling-cli' };
+    // 最后退回 PATH（macOS 上 npm 全局安装常见于 ~/.local/bin，而非 node 同目录）
+    const binName = process.platform === 'win32' ? 'dsh.cmd' : 'dsh';
+    for (const dir of String(process.env.PATH ?? '').split(delimiter)) {
+      if (!dir) continue;
+      const candidate = join(dir, binName);
+      if (existsSync(candidate)) return { command: candidate, prefixArgs: [], env: {}, label: 'path-cli' };
+    }
+    return null;
+  }
 
   // ---- 活动追踪 ----
   let lastActivity = nowSec();
@@ -310,31 +391,44 @@ export function apply(ctx, rawConfig = {}) {
     throw wrapped;
   }
 
-  /** 用 CLI 换插件版本：`dsh plugin --profile <p> add <pkg>@<ver>`（已装包替换装） */
+  /**
+   * 用 CLI 换插件版本：`dsh plugin --profile <p> add <pkg>@<ver>`（已装包替换装）。
+   * 返回 { ok, code, output, reason }，ok 仅表示命令成功退出。
+   */
   async function runPluginCliAdd(pkg, version) {
-    try {
-      const { spawn } = await import('node:child_process');
-      const { basename, dirname, join } = await import('node:path');
-      const profileName = profileDir ? basename(profileDir) : (process.env.DSH_PROFILE || 'web');
-      // 直接用 node bin 目录下的 dsh 入口（与 execPath 同目录），比 process.argv[1] 可靠
-      const dshBin = join(dirname(process.execPath), 'dsh');
-      const r = spawn(dshBin, [
-        'plugin', '--profile', profileName, 'add', `${pkg}@${version}`,
-      ], { stdio: ['ignore', 'pipe', 'pipe'], env: process.env });
-      let out = '';
-      r.stdout.on('data', (d) => { out += d; });
-      r.stderr.on('data', (d) => { out += d; });
-      const code = await new Promise((res) => {
-        const t = setTimeout(() => res(-1), 300000);
-        r.on('close', (c) => { clearTimeout(t); res(c); });
-        r.on('error', () => { clearTimeout(t); res(-1); });
-      });
-      log(`CLI add ${pkg}@${version} exit=${code}${out ? ` | ${out.slice(-200).replace(/\n/g, ' ')}` : ''}`);
-      return code === 0;
-    } catch (e) {
-      log(`CLI add ${pkg} threw: ${e.message}`);
-      return false;
+    const cli = resolvePluginCli();
+    if (!cli) {
+      const reason = '找不到可用的 dsh CLI（桌面 App 自带的 dsh-desktop-host 与 PATH 上的 dsh 都不可用）';
+      log('CLI add:', reason);
+      return { ok: false, code: -1, output: '', reason };
     }
+    const profileName = profileDir ? basename(profileDir) : (process.env.DSH_PROFILE || 'web');
+    // pnpm 自身不会在 registry 之间回退。国内链路 registry.npmjs.org 实测会连续
+    // CONNECT_TIMEOUT（一次 130 个包安装用了 3 分 14 秒），而版本查询用的 npmmirror
+    // 同一版本有同步副本、1~3 秒装完。先问 npmmirror，失败再退回 pnpm 默认源。
+    const attempts = [REGISTRIES[0], null];
+    let last = { ok: false, code: -1, output: '', reason: 'CLI 未执行' };
+    for (const registry of attempts) {
+      const args = [...cli.prefixArgs, 'plugin', '--profile', profileName, 'add', `${pkg}@${version}`];
+      if (registry) args.push(`--registry=${registry}`);
+      const run = await spawnCapture(cli.command, args, {
+        env: { ...process.env, ...cli.env },
+        timeoutMs: registry ? 240000 : 300000,
+      });
+      const output = run.output.trim();
+      const host = registry ? new URL(registry).host : 'default registry';
+      log(`CLI add ${pkg}@${version} [${cli.label}, ${host}] exit=${run.code}${output ? ` | ${output.slice(-300).replace(/\n/g, ' ')}` : ''}`);
+      if (run.code === 0) return { ok: true, code: 0, output };
+      last = {
+        ok: false,
+        code: run.code,
+        output,
+        reason: lastMeaningfulLine(output) || (run.code === -1 ? 'CLI 启动失败或超时' : `CLI 退出码 ${run.code}`),
+      };
+      // 启动失败/超时：换 registry 也不会更好，直接收手
+      if (run.code === -1) break;
+    }
+    return last;
   }
 
   /** 从当前进程 argv 里解析 --port（健康检查用） */
@@ -353,7 +447,10 @@ export function apply(ctx, rawConfig = {}) {
   function currentArgv() {
     try {
       return readFileSync('/proc/self/cmdline', 'utf8').split('\0').filter(Boolean);
-    } catch { return null; }
+    } catch {
+      // macOS / Windows 没有 /proc。至少返回数组，避免调用方对 null 调 .join()。
+      return process.argv.slice(1);
+    }
   }
 
   // ---- DSH 本体 ----
@@ -420,6 +517,14 @@ export function apply(ctx, rawConfig = {}) {
     const pendingExists = existsSync(pendingPath);
     const unit = config.systemdUnit || detectSystemdUnit();
 
+    // 桌面 App：DSH 本体由 electron-updater 负责，npm -g 不能也不该覆盖 .app 内的运行时；
+    // 插件更新也不能从进程内安全 relaunch（会连带杀掉正在跑的会话）。统一标记“待重启”。
+    if (isDesktopApp()) {
+      log('desktop build: in-process restart/apply unsupported — restart required');
+      await appendHistory({ kind: 'restart-required', reason: 'desktop-app', pending: pendingExists });
+      return;
+    }
+
     // 路径 A：仅插件更新（无 pending 文件）→ 无需 npm install，直接重启激活新插件
     if (!pendingExists) {
       log('no pending harness update — plugin-only restart');
@@ -429,7 +534,11 @@ export function apply(ctx, rawConfig = {}) {
         log('restart command returned — process still alive, keeping service as-is');
         return;
       }
-      // 无 systemd：只能退出 + 由子进程按 argv 拉起（旧兜底路径）
+      // 无 systemd 时旧代码会落到路径 B，但 apply-update.mjs 在没有 pending 文件时直接退出，
+      // 根本不会重启（macOS 上还会因为 currentArgv() 为 null 抛错）。这里明确改为“待重启”。
+      log('no systemd unit — cannot restart in place; restart required');
+      await appendHistory({ kind: 'restart-required', reason: 'no-systemd' });
+      return;
     }
 
     // 路径 B：本体更新 → 通过独立瞬时单元运行更新脚本（脱离 dsh-web cgroup）
@@ -492,6 +601,12 @@ export function apply(ctx, rawConfig = {}) {
 
   async function checkHarness(report) {
     if (config.harnessMode === 'off') return;
+    if (isDesktopApp()) {
+      // 桌面版的 DSH 本体是 .app 内的运行时，由 App 自己的 electron-updater 升级；
+      // 用 npm -g 覆盖既找不到安装路径，也会破坏签名/回滚。这里直接不查本体。
+      if (config.verbose) log('desktop build: DSH core updates are owned by the app updater — skip harness check');
+      return;
+    }
     if (existsSync(pendingPath)) {
       if (config.verbose) log('pending update already staged, skip harness check');
       return;
@@ -555,13 +670,22 @@ export function apply(ctx, rawConfig = {}) {
   const recentAttempts = new Map(); // `${name}@${latest}` -> ts
   const ATTEMPT_TTL = 24 * 3600 * 1000;
 
-  async function checkAndApplyPlugins(report, { exemptQuiet = false } = {}) {
+  async function checkAndApplyPlugins(report, { exemptQuiet = false, successes = [] } = {}) {
     const pm = ctx.pluginManager;
     if (!pm?.listBundles || !pm?.installBundle) return;
     const now = Date.now();
     for (const [k, ts] of recentAttempts) if (now - ts > ATTEMPT_TTL) recentAttempts.delete(k);
     const bundles = await pm.listBundles();
-    const items = (bundles ?? []).filter((b) => b?.installed && b?.removable && b.name !== 'dsh-autoupdater');
+    const items = (bundles ?? []).filter((b) => {
+      if (!b?.installed || !b?.removable || b.name === 'dsh-autoupdater') return false;
+      // link:/file:/workspace: 是本地开发目录，GitHub/tarball 是固定来源：npm 上的同名包
+      // 不是同一个东西（例如本地 @fffangchenghao/dsh-web-search 与 registry 同名包）。
+      // 用 registry 版本号去“升级”它们会把本地插件整个换掉，必须跳过。
+      const source = typeof b.source === 'string' ? b.source : '';
+      if (/(?:^|@)(?:link|file|workspace):/i.test(source)) return false;
+      if (/^(?:git\+|github:|gitlab:|bitbucket:|https?:|ssh:)/i.test(source)) return false;
+      return true;
+    });
     // 动手前的门：手动触发只要求"此刻无运行中会话"（豁免静默等待）；
     // 定时触发走完整空闲判定（无会话 + 静默满 idleSeconds）。
     const gate = exemptQuiet ? () => !anyAgentRunning() : isIdle;
@@ -585,23 +709,35 @@ export function apply(ctx, rawConfig = {}) {
           report.push(`${b.name} ${b.version} → ${latest} (24h 内已尝试，跳过重复安装)`);
           continue;
         }
-        report.push(`${b.name} ${b.version} → ${latest} (${decision})`);
+        const line = `${b.name} ${b.version} → ${latest} (${decision})`;
+        report.push(line);
         if (decision !== 'auto') continue;
         if (!gate()) { report.push(`  ⚠ 空闲丢失，跳过 ${b.name}`); continue; }
-        recentAttempts.set(key, now);
         // 显式带 @version：installBundle(裸名) 对精确钉版的包只会"确保已装"（pnpm 跳过），
         // 不会升级——这是假更新的根因。
-        let result = await pm.installBundle(`${b.name}@${latest}`);
-        // DSH 0.2.1+ 的 pluginManager 在「实时 profile」里拒绝替换已装包
-        // （ManagementError.code = already-installed，守卫见 dsh-plugin-manager:1991）。
-        // 此时退回 CLI 路径：`dsh plugin --profile <p> add <pkg>@<ver>`——独立进程写盘，
-        // 装完标记 restart-required，正是官方推荐的换版方式。
-        if (result?.application === 'failed' && result?.error?.code === 'already-installed') {
-          log(`plugin ${b.name}: service API refused (already-installed) → fallback to CLI`);
-          const ran = await runPluginCliAdd(b.name, latest);
-          result = ran
-            ? { application: 'restart-required', via: 'cli' }
-            : { application: 'failed', error: { code: 'cli-failed' } };
+        //
+        // 桌面 App 直接走安装包自带的 desktop CLI：
+        //  - pluginManager 在带 HMR 的实时 profile 里拒绝替换已装包（already-installed）；
+        //  - 普通 `dsh` CLI 拒绝 desktop 保留 profile，且 Electron 可执行文件旁没有 dsh。
+        let result;
+        if (isDesktopApp()) {
+          const cli = await runPluginCliAdd(b.name, latest);
+          result = cli.ok
+            ? { application: 'restart-required', via: 'cli', output: cli.output }
+            : { application: 'failed', error: { code: 'cli-failed', diagnostic: cli.reason } };
+        } else {
+          result = await pm.installBundle(`${b.name}@${latest}`);
+          // DSH 0.2.1+ 的 pluginManager 在「实时 profile」里拒绝替换已装包
+          // （ManagementError.code = already-installed，守卫见 dsh-plugin-manager:1991）。
+          // 此时退回 CLI 路径：`dsh plugin --profile <p> add <pkg>@<ver>`——独立进程写盘，
+          // 装完标记 restart-required，正是官方推荐的换版方式。
+          if (result?.application === 'failed' && result?.error?.code === 'already-installed') {
+            log(`plugin ${b.name}: service API refused (already-installed) → fallback to CLI`);
+            const cli = await runPluginCliAdd(b.name, latest);
+            result = cli.ok
+              ? { application: 'restart-required', via: 'cli', output: cli.output }
+              : { application: 'failed', error: { code: 'cli-failed', diagnostic: cli.reason } };
+          }
         }
         // 装完回读磁盘真实版本验证，不再信返回值
         let diskVer = null;
@@ -610,7 +746,17 @@ export function apply(ctx, rawConfig = {}) {
           diskVer = diskPkg?.version ?? null;
         }
         const reallyUpdated = diskVer == null ? true : diskVer !== b.version; // 无 profileDir 时退化为信安装结果
-        const ok = (result?.application === 'applied' || result?.application === 'restart-required') && reallyUpdated;
+        const reported = result?.application === 'applied' || result?.application === 'restart-required';
+        // CLI 已换版、但收尾 reconcile 失败（非 0 退出）时，磁盘才是唯一事实：
+        // package.json/node_modules 真变了，就按“已装、待重启”处理。
+        const cliTouchedDisk = result?.error?.code === 'cli-failed' && reallyUpdated;
+        const ok = reallyUpdated && (reported || cliTouchedDisk);
+        // 只有真正装上了才抑制 24h 重复安装；失败要允许下一轮重试（原实现失败也记 24h，
+        // 一次网络抖动会让这个包一整天不再尝试）。
+        if (ok) {
+          recentAttempts.set(key, now);
+          successes.push(line);
+        }
         // peerDeps 不兼容识别：插件新版要求更新的 DSH 本体，安装器主动拒绝。
         // 归类为"等待 DSH 更新"——不是错误，等 DSH 升级后下轮自动装上；不计入失败重试。
         // 结构化判定优先：官方 ManagementError.code === 'incompatible-version'
@@ -618,15 +764,18 @@ export function apply(ctx, rawConfig = {}) {
         const errMsg = result?.error?.diagnostic || result?.packageResult?.output || '';
         const peerBlocked = errCode === 'incompatible-version'
           || /is incompatible with dsh|incompatible with this dsh runtime/i.test(errMsg);
-        log(`plugin update ${b.name}:`, result?.application, `disk=${diskVer}`, reallyUpdated ? '✓' : '✗ 未变化', errMsg ? (errMsg.split('\n')[0] || '').slice(0, 120) : '');
-        await appendHistory({ kind: 'plugin', name: b.name, from: b.version, to: latest, outcome: result?.application, diskVer });
+        log(`plugin update ${b.name}:`, result?.application, `disk=${diskVer}`, reallyUpdated ? '✓' : '✗ 未变化', errMsg ? lastMeaningfulLine(errMsg, 160) : '');
+        await appendHistory({ kind: 'plugin', name: b.name, from: b.version, to: latest, outcome: result?.application, diskVer, ...(errMsg ? { reason: String(errMsg).slice(0, 300) } : {}) });
         if (!ok) {
           if (peerBlocked) {
             report.push(`  ⏸ ${b.name} ${latest} 需要更新的 DSH 本体（peerDeps 不兼容），已跳过——等 DSH 官方发布新版后自动安装`);
             await appendHistory({ kind: 'peer-blocked', name: b.name, to: latest });
           } else {
-            report.push(`  ✗ ${b.name} 更新失败: ${result?.application}${reallyUpdated ? '' : `（磁盘仍为 ${diskVer}）`}`);
+            const why = errMsg ? ` — ${lastMeaningfulLine(errMsg)}` : '';
+            report.push(`  ✗ ${b.name} 更新失败: ${result?.application}${reallyUpdated ? '' : `（磁盘仍为 ${diskVer}）`}${why}`);
           }
+        } else if (cliTouchedDisk) {
+          report.push(`  ⚠ ${b.name} 已写到 ${diskVer}，但 CLI 收尾报错（退出码 ${result?.error?.code === 'cli-failed' ? '非 0' : '?'}）——重启后确认`);
         }
       } catch (e) {
         log(`plugin check ${b.name} failed:`, e?.message);
@@ -668,13 +817,20 @@ export function apply(ctx, rawConfig = {}) {
       }
 
       const report = [];
-      await checkAndApplyPlugins(report, { exemptQuiet: trigger === 'manual' });
+      const successes = [];
+      await checkAndApplyPlugins(report, { exemptQuiet: trigger === 'manual', successes });
       try {
         await checkHarness(report);
       } catch (e) {
         // 本体检查的网络失败不应抹掉本轮插件检查的成果（report 已有部分结果）
         report.push(`⚠ 本体检查失败（网络）：${e?.message?.slice(0, 80)}`);
         log('harness check failed (network):', e?.message);
+      }
+
+      // 桌面 App 不能从进程内部重启：把“需要重启才生效”写进本轮结果，面板里直接可见。
+      // 只统计真正成功的 upgrade（successes），失败/跳过/仅通知的版本行不算。
+      if (successes.length > 0 && isDesktopApp()) {
+        report.push('  ⏻ 插件已更新到磁盘，重启 DeepSeek Harness 后生效');
       }
 
       state.updates = report;
@@ -685,14 +841,19 @@ export function apply(ctx, rawConfig = {}) {
 
       // 立即检查且本轮有实际更新动作 → 延时 10 秒重启 DSH，
       // 让 restart-required 的新插件与本体重启一并生效。
-      const applied = report.filter((line) =>
-        typeof line === 'string' && (/\(auto\)$/.test(line) || /\(staged\)$/.test(line)) && !/跳过/.test(line));
+      // 只把真正装上的插件算作“已应用”；旧实现按报告里的版本行匹配，
+      // 更新失败时也会触发一次重启（并在 macOS 上撞上 currentArgv 为 null）。
+      const pluginOnly = successes;
       // 手动检查的"10 秒后重启"只适用于纯插件更新（无需 npm install）。
       // 本体更新必须走 staged → 宽限期 → 安装并校验 → 重启，绝不能 10 秒就杀进程
       // （2026-10-18 事故：10 秒重启抢在 npm install 之前，服务空停 61 分钟）。
-      const hadHarnessStage = applied.some((l) => /\(staged\)$/.test(l));
-      const pluginOnly = applied.filter((l) => !/\(staged\)$/.test(l));
+      const hadHarnessStage = report.some((line) => typeof line === 'string' && /\(staged\)$/.test(line));
       if (trigger === 'manual' && pluginOnly.length > 0 && !hadHarnessStage) {
+        if (isDesktopApp()) {
+          log('desktop build: plugin files updated — restart required, not restarting in-process');
+          await appendHistory({ kind: 'restart-required', reason: 'desktop-app', updates: pluginOnly });
+          return;
+        }
         log(`plugin updates applied (${pluginOnly.length}), restart DSH in 10s`);
         await appendHistory({ kind: 'manual-restart-scheduled', updates: pluginOnly, inSeconds: 10 });
         await sleep(10000);
