@@ -111,13 +111,34 @@ function nextRunAt(c, fromMs = Date.now()) {
   return fromMs + c.everyMinutes * 60_000;
 }
 
+function parseVer(v) {
+  if (!v) return null;
+  const m = String(v).replace(/^v/, '').match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/);
+  if (!m) return null;
+  const pre = m[4] === undefined ? [] : m[4].split('.').map((p) => /^\d+$/.test(p) ? Number(p) : p);
+  return { major: +m[1], minor: +m[2], patch: +m[3], pre };
+}
+// 语义化版本比较（semver.org 规范第 11 条）：核心三位逐段比；
+// 相同时比预发布标签——无标签（正式版）> 有标签；都是预发布则逐段比，
+// 数字段按数值、标识符段按字典序，段数少的更小（rc.2 < rc.2.1）。
 function semverGt(a, b) {
-  if (!a || !b) return false;
-  const pa = String(a).replace(/^v/, '').split(/[.+-]/).map(Number);
-  const pb = String(b).replace(/^v/, '').split(/[.+-]/).map(Number);
-  for (let i = 0; i < 3; i++) {
-    const x = pa[i] || 0, y = pb[i] || 0;
-    if (x !== y) return x > y;
+  const A = parseVer(a), B = parseVer(b);
+  if (!A || !B) return false;
+  if (A.major !== B.major) return A.major > B.major;
+  if (A.minor !== B.minor) return A.minor > B.minor;
+  if (A.patch !== B.patch) return A.patch > B.patch;
+  if (!A.pre.length && !B.pre.length) return false;
+  if (!A.pre.length) return true;   // 正式版 > 预发布
+  if (!B.pre.length) return false;
+  for (let i = 0; i < Math.max(A.pre.length, B.pre.length); i++) {
+    const x = A.pre[i], y = B.pre[i];
+    if (x === undefined) return false; // 段少 = 更小
+    if (y === undefined) return true;
+    if (x === y) continue;
+    const xn = typeof x === 'number', yn = typeof y === 'number';
+    if (xn && yn) return x > y;           // 数字段：数值比较
+    if (!xn && !yn) return x > y;         // 字符串段：字典序（beta > alpha）
+    return !xn;                           // 混合：数字 < 字母（semver 规范）——x 是数字则 x 更小
   }
   return false;
 }
