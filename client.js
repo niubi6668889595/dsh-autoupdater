@@ -898,9 +898,10 @@ window.__ModuleLoader__.load({
           id: 'dsh-autoupdater-digest',
           children: { 'autoupdater.digest': { kind: 'chain', scope: 'root' } },
         }, function OverlayHost(props) {
-          const renderSlot = props && props.renderSlot;
-          if (typeof renderSlot === 'function') {
-            return renderSlot('autoupdater.digest', {});
+          // chain 槽必须用 renderSlotChain（框架报错里明确要求的）
+          const render = (props && props.renderSlotChain) || (props && props.renderSlot);
+          if (typeof render === 'function') {
+            return render('autoupdater.digest', {});
           }
           return h(DigestHost);
         }));
