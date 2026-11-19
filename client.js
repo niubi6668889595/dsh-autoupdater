@@ -576,15 +576,146 @@ window.__ModuleLoader__.load({
 
         // 卡片摘要（插件管理器列表里的一行说明）
         function Summary() {
+          const [dg, setDg] = React.useState(null);
+          React.useEffect(() => {
+            let alive = true;
+            const load = () => fetch('/api/autoupdater/digest')
+              .then((r) => (r.ok ? r.json() : null))
+              .then((d) => { if (alive && d?.hasChanges) setDg(d); })
+              .catch(() => {});
+            load();
+            const timer = setInterval(load, 120000);
+            return () => { alive = false; clearInterval(timer); };
+          }, []);
+          const n = dg ? (dg.counts?.plugins ?? 0) + (dg.counts?.harness ?? 0) : 0;
           return h('span', { style: { color: T.text2, fontSize: 12, display: 'inline-flex', alignItems: 'center', gap: 5 } },
             h('span', { 'aria-hidden': true }, '⟳'),
-            '自动更新 · 空闲窗口执行 · 点击进入设置');
+            n > 0
+              ? h('span', { style: { color: T.error, fontWeight: 600 } },
+                  `有 ${n} 项更新待查看`)
+              : '自动更新 · 空闲窗口执行 · 点击进入设置');
         }
         // 详情页（点开卡片后的完整设置面板）
         function Page(props) {
           if (props.view === 'summary') return h(Summary);
-          return h(App);
+          // 详情页：顶部先放"你不在的时候更新了什么"，下面才是设置面板
+          return h('div', null, h(DigestBanner), h(App));
         }
+        // ─────────────────── 变更汇总（内嵌卡片，不依赖 overlay 定位）───────────────────
+        function DigestBanner() {
+          const [digest, setDigest] = React.useState(null);
+          const [expanded, setExpanded] = React.useState(false);
+          const [busy, setBusy] = React.useState(false);
+
+          React.useEffect(() => {
+            let alive = true;
+            const load = () => fetch('/api/autoupdater/digest')
+              .then((r) => (r.ok ? r.json() : null))
+              .then((d) => { if (alive && d?.hasChanges) setDigest(d); })
+              .catch(() => {});
+            load();
+            const timer = setInterval(load, 120000);
+            return () => { alive = false; clearInterval(timer); };
+          }, []);
+
+          if (!digest || !digest.hasChanges) return null;
+
+          const ack = async () => {
+            if (busy) return;
+            setBusy(true);
+            try {
+              await fetch('/api/autoupdater/digest', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ at: digest.now }),
+              });
+              setDigest(null);
+            } catch {}
+            setBusy(false);
+          };
+
+          const row = (key, left, mid, right, color) => h('div', {
+            key,
+            style: {
+              display: 'flex', alignItems: 'baseline', gap: 8,
+              padding: '5px 0', fontSize: 13, borderBottom: `1px solid ${T.border}`,
+            },
+          },
+            h('span', { style: { flex: 1, color: T.text, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, left),
+            h('span', { style: { color: T.text3, fontSize: 12, fontFamily: 'ui-monospace, monospace' } }, mid),
+            h('span', { style: { color, fontSize: 12, flex: 'none' } }, right),
+          );
+
+          const allPlugins = digest.plugins || [];
+          const shown = expanded ? allPlugins : allPlugins.slice(0, 6);
+          const rn = digest.releaseNotes;
+
+          return h('div', {
+            style: {
+              border: `1px solid ${T.border}`, borderRadius: 'var(--dsw-radius-lg, 12px)',
+              padding: '14px 16px', marginBottom: 16, background: T.bg2,
+            },
+          },
+            h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 6 } },
+              h('div', {
+                style: { fontSize: 14, fontWeight: 600, color: T.text },
+              }, '你不在的时候，这些更新了'),
+              h('button', {
+                type: 'button', onClick: ack, disabled: busy,
+                style: {
+                  padding: '5px 14px', fontSize: 12, cursor: busy ? 'default' : 'pointer',
+                  background: T.btnFill, color: T.btnLabel, border: 'none',
+                  borderRadius: 'var(--dsw-radius-md, 8px)', opacity: busy ? 0.6 : 1,
+                },
+              }, busy ? '处理中…' : '知道了'),
+            ),
+            h('div', { style: { fontSize: 12, color: T.text3, marginBottom: 10 } },
+              `上次确认：${digest.sinceLabel}`),
+
+            (digest.harness || []).length
+              ? h('div', { style: { fontSize: 12, fontWeight: 600, color: T.text2, margin: '8px 0 2px' } }, 'DSH 本体')
+              : null,
+            (digest.harness || []).map((u, i) =>
+              row(`h${i}`, 'DSH 本体', `${u.from ?? '?'} → ${u.to ?? '?'}`, u.healthy ? '✓' : '⚠', T.success)),
+
+            rn && rn.highlights && rn.highlights.length
+              ? h('div', { style: { marginTop: 8 } },
+                  rn.breaking && rn.breaking.length
+                    ? h('div', {
+                        style: {
+                          border: '1px solid var(--dsw-alias-status-error, #d33)',
+                          borderRadius: 'var(--dsw-radius-md, 8px)', padding: '6px 9px', margin: '6px 0',
+                          fontSize: 12, color: T.error,
+                        },
+                      }, '⚠ 含破坏性变更：', rn.breaking.join('；'))
+                    : null,
+                  h('div', { style: { maxHeight: 110, overflowY: 'auto', fontSize: 12, lineHeight: 1.6, color: T.text2 } },
+                    rn.highlights.slice(0, 12).map((l, i) => h('div', { key: `rn${i}` }, l))))
+              : null,
+
+            allPlugins.length
+              ? h('div', { style: { fontSize: 12, fontWeight: 600, color: T.text2, margin: '10px 0 2px' } },
+                  `插件 (${allPlugins.length})`)
+              : null,
+            shown.map((p) => row(`p${p.name}${p.to}`, p.name, `${p.from ?? '?'} → ${p.to ?? '?'}`, p.ok ? '✓' : '✗', p.ok ? T.success : T.error)),
+            allPlugins.length > 6
+              ? h('button', {
+                  type: 'button', onClick: () => setExpanded((v) => !v),
+                  style: { background: 'none', border: 'none', padding: '6px 0 0', color: T.brand, fontSize: 12, cursor: 'pointer' },
+                }, expanded ? '收起' : `展开全部 ${allPlugins.length} 项`)
+              : null,
+
+            (digest.problems || []).length
+              ? h('div', { style: { marginTop: 10 } },
+                  h('div', { style: { fontSize: 12, fontWeight: 600, color: T.text2, marginBottom: 2 } },
+                    `需要注意 (${digest.problems.length})`),
+                  digest.problems.map((m, i) => h('div', {
+                    key: `x${i}`, style: { fontSize: 12, color: T.error, lineHeight: 1.6 },
+                  }, '• ', m)))
+              : null,
+          );
+        }
+
         // ─────────────────── 变更汇总弹窗（shell.overlay）───────────────────
         // 班总 2026-11-19 要求：升级发生在深夜空闲时段，人不在；之后任何时刻
         // 打开网页都要看到「我离开后你更新了什么」。判据是"上次点知道了"而非
