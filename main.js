@@ -464,49 +464,54 @@ export function apply(ctx, rawConfig = {}) {
       ['AUTOUPDATE_ARGV', currentArgv().join(' ')],
     ];
 
+    // ── 单一路径，绝不双开（2026-11-19 修复）───────────────────────────────
+    // 事故回顾：systemd-run 默认【阻塞到 unit 执行完毕】，而 npm -g 安装本体要 1-3 分钟。
+    // 旧代码只等 20 秒 → 必然超时 → 误判"启动失败" → 又 spawn 一个 fallback 进程。
+    // 两个 npm 同时升级同一目录 → ENOTEMPTY / spawn sh ENOENT → lib 与 package.json 被删。
+    //
+    // 现在的原则：
+    //   1. 必须带 --no-block：systemd-run 只负责把 unit 排进去，立刻返回；
+    //   2. 失败就是失败：只记日志 + history，绝不 fallback 重跑（宁可这次不更新）；
+    //   3. 没有 systemd 就完全不升级本体，并明确告知原因。
+    if (!unit) {
+      log('no systemd unit — refusing to apply harness update without a supervisor');
+      await appendHistory({ kind: 'harness-aborted', reason: 'no systemd unit for apply' });
+      return;
+    }
+
     let launched = false;
-    if (unit) {
-      try {
-        const svcUser = process.env.USER || process.env.LOGNAME || 'ban';
-        const args = ['-n', 'systemd-run', '--unit=dsh-autoupdater-apply', '--collect',
-          '--property=Type=oneshot', '--property=StandardOutput=journal',
-          '--property=StandardError=journal',
-          `--uid=${svcUser}`, `--gid=${svcUser}`, // 必须与运行 dsh 的用户一致（npm -g 权限）
-        ];
-        for (const [k, v] of envPairs) args.push(`--setenv=${k}=${v}`);
-        args.push(process.execPath, self);
-        const r = spawn('sudo', args, { detached: true, stdio: 'ignore' });
-        const code = await new Promise((res) => {
-          const t = setTimeout(() => res(-1), 20000);
-          r.on('close', (c) => { clearTimeout(t); res(c); });
-          r.on('error', () => { clearTimeout(t); res(-1); });
-        });
-        log(`systemd-run apply unit launched (exit=${code})`);
-        launched = code === 0;
-        if (!launched) {
-          log('systemd-run failed; falling back to detached child (may be killed by cgroup)');
-        }
-      } catch (e) {
-        log(`systemd-run threw: ${e.message}`);
-      }
-    }
-
-    if (!launched) {
-      const child = spawn(process.execPath, [self], {
-        detached: true,
-        stdio: 'ignore',
-        env: {
-          ...process.env,
-          AUTOUPDATE_STATE_DIR: stateDir,
-          AUTOUPDATE_SYSTEMD_UNIT: unit,
-          AUTOUPDATE_ARGV: currentArgv().join(' '),
-        },
+    try {
+      const svcUser = process.env.USER || process.env.LOGNAME || 'ban';
+      const args = ['-n', 'systemd-run', '--no-block', // ★ 不等待 unit 结束
+        '--unit=dsh-autoupdater-apply', '--collect',
+        '--property=Type=oneshot', '--property=StandardOutput=journal',
+        '--property=StandardError=journal',
+        `--uid=${svcUser}`, `--gid=${svcUser}`, // 必须与运行 dsh 的用户一致（npm -g 权限）
+      ];
+      for (const [k, v] of envPairs) args.push(`--setenv=${k}=${v}`);
+      args.push(process.execPath, self);
+      const r = spawn('sudo', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+      let out = '';
+      r.stdout.on('data', (d) => { out += d; });
+      r.stderr.on('data', (d) => { out += d; });
+      const code = await new Promise((res) => {
+        const t = setTimeout(() => res(-1), 30000); // --no-block 下应当秒回，30s 只是保险
+        r.on('close', (c) => { clearTimeout(t); res(c); });
+        r.on('error', () => { clearTimeout(t); res(-1); });
       });
-      child.unref();
-      log('detached apply child spawned (fallback path)');
+      log(`systemd-run --no-block exit=${code}${out ? ` | ${out.trim().slice(0, 200)}` : ''}`);
+      launched = code === 0;
+      if (!launched) {
+        log('systemd-run failed — NOT falling back (a second installer would corrupt the package)');
+      }
+    } catch (e) {
+      log(`systemd-run threw: ${e.message}`);
     }
 
-    await appendHistory({ kind: 'harness-apply-launched', to: harnessNotice?.version, via: launched ? 'systemd-run' : 'detached' });
+    await appendHistory({
+      kind: launched ? 'harness-apply-launched' : 'harness-apply-launch-failed',
+      to: harnessNotice?.version, via: 'systemd-run',
+    });
     // 不再主动退出：更新脚本会自己完成 npm install → 校验 → 重启服务。
     // 服务活着期间用户仍可正常使用（只是稍后会被重启打断，这是升级的必要代价）。
   }

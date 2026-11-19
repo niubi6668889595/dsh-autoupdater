@@ -8,7 +8,7 @@
 //   AUTOUPDATE_SYSTEMD_UNIT  要重启的 systemd 服务名（可空）
 //   AUTOUPDATE_ARGV          原启动 argv（空格分隔，systemd 不可用时的裸拉起兜底）
 
-import { readFileSync, existsSync, rmSync, appendFileSync, mkdirSync, cpSync, writeFileSync } from 'node:fs';
+import { readFileSync, existsSync, rmSync, appendFileSync, mkdirSync, cpSync, writeFileSync, openSync, closeSync, unlinkSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 
@@ -31,6 +31,45 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 alog(`apply-update started (pid=${process.pid}, stateDir=${stateDir})`);
 
 if (!stateDir) { alog('AUTOUPDATE_STATE_DIR missing'); process.exit(1); }
+
+// ── 并发锁（最后一道防线）─────────────────────────────────────────────────
+// 2026-11-19：两个 apply 实例同时 npm -g 升级同一目录，互相删除对方文件，
+// 导致 lib/ 与 package.json 被清空。即使将来再出现双开路径，这里也必须拦住。
+const lockPath = join(stateDir, 'apply.lock');
+function acquireLock() {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = openSync(lockPath, 'wx'); // wx = 独占创建，已存在则 EEXIST
+      writeFileSync(fd, `${process.pid} ${new Date().toISOString()}\n`);
+      closeSync(fd);
+      return true;
+    } catch (e) {
+      if (e.code !== 'EEXIST') { alog(`lock error: ${e.code} ${e.message}`); return false; }
+      // 锁已存在：判断持有者是否还活着（进程号 + 存活检测）
+      let holder = NaN;
+      try { holder = Number(String(readFileSync(lockPath, 'utf8')).split(/\s+/)[0]); } catch {}
+      let alive = false;
+      if (Number.isFinite(holder) && holder > 0) {
+        try { process.kill(holder, 0); alive = true; } catch { alive = false; }
+      }
+      if (alive) {
+        alog(`another apply is running (pid=${holder}) — EXITING to avoid concurrent npm install`);
+        return false;
+      }
+      alog(`stale lock (pid=${holder} not alive) — removing and retrying`);
+      try { unlinkSync(lockPath); } catch {}
+    }
+  }
+  return false;
+}
+if (!acquireLock()) {
+  alog('could not acquire apply lock — nothing done');
+  process.exit(0); // 不是错误：另一个实例正在做，让它做完
+}
+const releaseLock = () => { try { unlinkSync(lockPath); } catch {} };
+process.on('exit', releaseLock);
+process.on('SIGTERM', () => { releaseLock(); process.exit(143); });
+process.on('SIGINT', () => { releaseLock(); process.exit(130); });
 if (!existsSync(pendingPath)) { alog('no pending-update.json'); process.exit(0); }
 
 const instruction = JSON.parse(readFileSync(pendingPath, 'utf8'));
