@@ -883,7 +883,15 @@ window.__ModuleLoader__.load({
             setDigest(null);
           };
 
-          return h(DigestModal, { digest, onAck: ack });
+          // 诊断：无论有无数据都渲染一个可见标记，确认组件是否被调用
+          return h('div', {
+            style: {
+              position: 'fixed', left: 8, bottom: 8, zIndex: 99999,
+              background: '#e00', color: '#fff', fontSize: 11,
+              padding: '2px 6px', borderRadius: 4,
+            },
+          }, digest ? `DBG 有数据:${digest.counts?.plugins ?? 0}` : 'DBG 无数据', 
+             h(DigestModal, { digest, onAck: ack }));
         }
 
         // shell.overlay 是 kind:'list' 的容器槽 —— 必须用 children 声明真正的组件槽，
