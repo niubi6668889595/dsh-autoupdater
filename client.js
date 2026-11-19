@@ -627,7 +627,7 @@ window.__ModuleLoader__.load({
               await fetch('/api/autoupdater/digest', {
                 method: 'POST',
                 headers: { 'content-type': 'application/json' },
-                body: JSON.stringify({ at: digest.now }),
+                body: JSON.stringify({ at: digest.eventsMaxAt || digest.now }),
               });
               setDigest(null);
             } catch {}
@@ -721,6 +721,8 @@ window.__ModuleLoader__.load({
         // 打开网页都要看到「我离开后你更新了什么」。判据是"上次点知道了"而非
         // "上次打开页面"——打开没看等于没看到。
         function DigestModal(props) {
+          // 确认锚点用 digest.eventsMaxAt（本轮覆盖到的最新事件时间），
+          // 不用 digest.now —— 否则弹窗打开期间发生的新事件会被一起确认掉。
           const { digest, onAck } = props;
           const [busy, setBusy] = React.useState(false);
           // ⚠ 所有 hooks 必须在提前 return 之前——否则 digest 由 null 变有值时
@@ -789,7 +791,7 @@ window.__ModuleLoader__.load({
           const ack = async () => {
             if (busy) return;
             setBusy(true);
-            try { await onAck(digest.now); } finally { setBusy(false); }
+            try { await onAck(digest.eventsMaxAt || digest.now); } finally { setBusy(false); }
           };
 
           return h('div', {

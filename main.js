@@ -856,11 +856,15 @@ export function apply(ctx, rawConfig = {}) {
       releaseNotes = await fetchReleaseNotes(lastHarness.to).catch(() => null);
     }
 
+    // 确认锚点 = 本轮实际覆盖到的最新事件时间，而不是"当前时间"。
+    // 否则用户在弹窗打开期间点了确认，会把之后才发生的事件一起"确认掉"。
+    const eventsMaxAt = events.reduce((m, e) => (e.at > m ? e.at : m), '');
     return {
       ok: true,
       since: state.lastAcknowledgedAt,
       sinceLabel: state.lastAcknowledgedAt ? new Date(sinceMs).toLocaleString('zh-CN') : '（首次使用，展示全部记录）',
       now: new Date().toISOString(),
+      eventsMaxAt: eventsMaxAt || new Date().toISOString(),
       hasChanges: events.length > 0,
       plugins,
       harness,
