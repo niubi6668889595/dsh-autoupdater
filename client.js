@@ -907,16 +907,12 @@ window.__ModuleLoader__.load({
           return null;
         }));
 
-        // 子槽：真正承载弹窗组件（chain 槽也需要唯一 id）
-        ctx.slots.inject('autoupdater.digest', () => {
-          console.log('[dsh-autoupdater] registering autoupdater.digest child slot');
-          const d = ctx.slots.register({
-            name: 'autoupdater.digest',
-            id: 'dsh-autoupdater-digest-content',
-          }, DigestHost);
-          console.log('[dsh-autoupdater] child slot registered:', typeof d);
-          return d;
-        });
+        // 子槽：真正承载弹窗组件。
+        // 关键：只声明 children 不会挂载任何东西，子槽必须单独 register 一次。
+        ctx.slots.inject('autoupdater.digest', () => ctx.slots.register({
+          name: 'autoupdater.digest',
+          id: 'dsh-autoupdater-digest-content',
+        }, DigestHost));
 
         ctx.slots.inject('plugins.item', () => ctx.slots.register({
           name: 'plugins.item',
