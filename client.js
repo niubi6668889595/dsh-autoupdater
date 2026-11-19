@@ -585,6 +585,167 @@ window.__ModuleLoader__.load({
           if (props.view === 'summary') return h(Summary);
           return h(App);
         }
+        // ─────────────────── 变更汇总弹窗（shell.overlay）───────────────────
+        // 班总 2026-11-19 要求：升级发生在深夜空闲时段，人不在；之后任何时刻
+        // 打开网页都要看到「我离开后你更新了什么」。判据是"上次点知道了"而非
+        // "上次打开页面"——打开没看等于没看到。
+        function DigestModal(props) {
+          const { digest, onAck } = props;
+          const [busy, setBusy] = React.useState(false);
+          if (!digest || !digest.hasChanges) return null;
+
+          const rowStyle = {
+            display: 'flex', alignItems: 'baseline', gap: 8,
+            padding: '7px 0', borderBottom: `1px solid ${T.border}`, fontSize: 13,
+          };
+          const verStyle = { color: T.text3, fontFamily: 'ui-monospace, monospace', fontSize: 12 };
+
+          const sectionTitle = (text, count) => h('div', {
+            style: {
+              fontSize: 12, fontWeight: 600, color: T.text2, letterSpacing: '.02em',
+              margin: '16px 0 4px', textTransform: 'uppercase',
+            },
+          }, text, count != null ? ` (${count})` : '');
+
+          const pluginRows = (digest.plugins || []).map((p) => h('div', { key: `p:${p.name}@${p.to}`, style: rowStyle },
+            h('span', { style: { flex: 1, color: T.text, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, p.name),
+            h('span', { style: verStyle }, `${p.from ?? '?'} → ${p.to ?? '?'}`),
+            h('span', { style: { color: p.ok ? T.success : T.error, fontSize: 12, flex: 'none' } }, p.ok ? '✓' : '✗'),
+          ));
+
+          const harnessRows = (digest.harness || []).map((u, i) => h('div', { key: `h:${i}`, style: rowStyle },
+            h('span', { style: { flex: 1, color: T.text } }, 'DSH 本体'),
+            h('span', { style: verStyle }, `${u.from ?? '?'} → ${u.to ?? '?'}`),
+            h('span', { style: { color: T.success, fontSize: 12, flex: 'none' } }, u.healthy ? '✓' : '⚠'),
+          ));
+
+          const problemRows = (digest.problems || []).map((msg, i) => h('div', {
+            key: `x:${i}`,
+            style: { padding: '6px 0', fontSize: 12.5, color: T.error, lineHeight: 1.5 },
+          }, '• ', msg));
+
+          const rn = digest.releaseNotes;
+          const noteBlock = rn && rn.highlights.length ? h('div', { style: { marginTop: 14 } },
+            sectionTitle('本体功能摘要'),
+            rn.breaking && rn.breaking.length
+              ? h('div', {
+                  style: {
+                    background: 'color-mix(in srgb, var(--dsw-alias-status-error, #d33) 12%, transparent)',
+                    border: `1px solid var(--dsw-alias-status-error, #d33)`,
+                    borderRadius: 'var(--dsw-radius-md, 8px)', padding: '8px 10px', margin: '6px 0',
+                    fontSize: 12.5, color: T.text,
+                  },
+                }, '⚠ 含破坏性变更：', rn.breaking.join('；'))
+              : null,
+            h('div', { style: { maxHeight: 150, overflowY: 'auto', fontSize: 12.5, lineHeight: 1.6, color: T.text2 } },
+              rn.highlights.map((line, i) => h('div', {
+                key: `rn:${i}`,
+                style: { padding: '1px 0', ...(/^[^\-]/.test(line) && line.length < 30 ? { fontWeight: 600, color: T.text, marginTop: 4 } : {}) },
+              }, line)),
+            ),
+            rn.url ? h('a', {
+              href: rn.url, target: '_blank', rel: 'noreferrer',
+              style: { fontSize: 12, color: T.brand, textDecoration: 'none', display: 'inline-block', marginTop: 6 },
+            }, '查看完整 Release Notes →') : null,
+          ) : null;
+
+          const ack = async () => {
+            if (busy) return;
+            setBusy(true);
+            try { await onAck(digest.now); } finally { setBusy(false); }
+          };
+
+          return h('div', {
+            style: {
+              position: 'fixed', inset: 0, zIndex: 4000,
+              background: 'rgba(0,0,0,.42)', backdropFilter: 'blur(2px)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20,
+            },
+            role: 'dialog', 'aria-modal': 'true', 'aria-label': '自动更新汇总',
+          }, h('div', {
+            style: {
+              width: '100%', maxWidth: 560, maxHeight: '82vh', display: 'flex', flexDirection: 'column',
+              background: T.bg1, color: T.text,
+              border: `1px solid ${T.border}`, borderRadius: 'var(--dsw-radius-lg, 12px)',
+              boxShadow: '0 16px 48px rgba(0,0,0,.32)',
+            },
+          },
+            // 头部
+            h('div', { style: { padding: '16px 20px 10px', borderBottom: `1px solid ${T.border}` } },
+              h('div', { style: { fontSize: 15, fontWeight: 600 } }, '你不在的时候，这些更新了'),
+              h('div', { style: { fontSize: 12, color: T.text3, marginTop: 4 } },
+                `上次确认：${digest.sinceLabel}`),
+            ),
+            // 正文
+            h('div', { style: { padding: '4px 20px 8px', overflowY: 'auto', flex: 1 } },
+              harnessRows.length ? sectionTitle('DSH 本体', harnessRows.length) : null,
+              harnessRows,
+              noteBlock,
+              pluginRows.length ? sectionTitle('插件', pluginRows.length) : null,
+              pluginRows,
+              problemRows.length ? sectionTitle('需要注意', problemRows.length) : null,
+              problemRows,
+            ),
+            // 底部
+            h('div', {
+              style: {
+                padding: '12px 20px', borderTop: `1px solid ${T.border}`,
+                display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12,
+              },
+            },
+              h('span', { style: { fontSize: 11.5, color: T.text3 } },
+                '确认后不再重复提示，直到下次有新更新'),
+              h('button', {
+                type: 'button', onClick: ack, disabled: busy,
+                style: {
+                  padding: '7px 20px', fontSize: 13, fontWeight: 500,
+                  background: T.btnFill, color: T.btnLabel, border: 'none',
+                  borderRadius: 'var(--dsw-radius-md, 8px)', cursor: busy ? 'default' : 'pointer',
+                  opacity: busy ? 0.6 : 1,
+                },
+              }, busy ? '处理中…' : '知道了'),
+            ),
+          ));
+        }
+
+        // 弹窗宿主：拉取 digest → 有变更就挂载
+        function DigestHost() {
+          const [digest, setDigest] = React.useState(null);
+          React.useEffect(() => {
+            let alive = true;
+            const load = async () => {
+              try {
+                const r = await fetch('/api/autoupdater/digest');
+                if (!r.ok) return;
+                const d = await r.json();
+                if (alive && d?.hasChanges) setDigest(d);
+              } catch {}
+            };
+            load();
+            // 升级可能发生在页面打开期间（空闲窗口），每 2 分钟复查一次
+            const timer = setInterval(load, 120000);
+            return () => { alive = false; clearInterval(timer); };
+          }, []);
+
+          const ack = async (at) => {
+            try {
+              await fetch('/api/autoupdater/digest', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ at }),
+              });
+            } catch {}
+            setDigest(null);
+          };
+
+          return h(DigestModal, { digest, onAck: ack });
+        }
+
+        ctx.slots.inject('shell.overlay', () => ctx.slots.register({
+          name: 'shell.overlay',
+          id: 'dsh-autoupdater-digest',
+        }, DigestHost));
+
         ctx.slots.inject('plugins.item', () => ctx.slots.register({
           name: 'plugins.item',
           id: 'dsh-autoupdater',

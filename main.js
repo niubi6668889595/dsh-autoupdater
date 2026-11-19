@@ -163,7 +163,7 @@ export function apply(ctx, rawConfig = {}) {
   const pendingPath = `${stateDir}/pending-update.json`;
   const hotConfigPath = `${stateDir}/config.json`;
 
-  let state = { lastRun: null, lastNotice: null, updates: [], lastError: null };
+  let state = { lastRun: null, lastNotice: null, updates: [], lastError: null, lastAcknowledgedAt: null };
   readJson(statePath).then((s) => { if (s) state = { ...state, ...s }; }).catch(() => {});
 
   // 初始配置 = YAML 注入值；运行时覆盖来自 config.json（每次调度/检查前重读）
@@ -800,6 +800,99 @@ export function apply(ctx, rawConfig = {}) {
   }
 
   /** 最近活动日志（history.jsonl 尾部，供前端展示） */
+  /**
+   * 构建「自上次确认以来的变更汇总」，供网页弹窗展示。
+   *
+   * 设计意图（班总 2026-11-19 要求）：升级发生在深夜空闲时段，人不在；
+   * 之后任何时刻打开网页，都必须看到「我离开后你更新了什么」。
+   * 判据是 lastAcknowledgedAt（用户点「知道了」的时间），不是页面打开时间——
+   * 打开过但没看等于没看到。
+   */
+  async function buildDigest() {
+    const sinceMs = state.lastAcknowledgedAt ? Date.parse(state.lastAcknowledgedAt) : 0;
+    const history = await recentLogs(3000);
+    // 只看"实际发生了什么"的事件；check 是例行轮询，不进汇总
+    const RELEVANT = new Set(['plugin', 'harness-applied', 'harness-rolled-back', 'harness-aborted', 'peer-blocked']);
+    const events = history.filter((e) => {
+      const t = Date.parse(e?.at ?? '');
+      return Number.isFinite(t) && t > sinceMs && RELEVANT.has(e.kind);
+    });
+
+    const plugins = [];
+    const harness = [];
+    const problems = [];
+    const seenPlugin = new Set();
+
+    for (const e of events) {
+      if (e.kind === 'plugin') {
+        const key = `${e.name}@${e.to}`;
+        if (seenPlugin.has(key)) continue;      // 同一目标版本只报一次
+        seenPlugin.add(key);
+        const ok = e.outcome === 'applied' || e.outcome === 'restart-required';
+        plugins.push({
+          name: e.name, from: e.from, to: e.to,
+          ok, outcome: e.outcome ?? null, diskVersion: e.diskVer ?? null,
+        });
+        if (!ok) problems.push(`${e.name} ${e.from} → ${e.to}：更新失败（磁盘仍为 ${e.diskVer ?? '未知'}）`);
+      } else if (e.kind === 'harness-applied') {
+        harness.push({ from: e.from ?? null, to: e.applied ?? e.to ?? null, at: e.at, healthy: e.healthy !== false });
+      } else if (e.kind === 'harness-rolled-back') {
+        problems.push(`DSH 本体升级到 ${e.to} 失败（${e.reason ?? '未知原因'}），已自动回滚${e.recovered ? '并恢复' : '但未能恢复'}`);
+      } else if (e.kind === 'harness-aborted') {
+        problems.push(`DSH 本体升级中止：${e.reason ?? '未知原因'}`);
+      } else if (e.kind === 'peer-blocked') {
+        problems.push(`${e.name} ${e.to}：需要更新的 DSH 本体（peerDeps 不兼容），已跳过`);
+      }
+    }
+
+    // 本体功能摘要：只在有本体升级时才去抓 release notes（网络开销可控）
+    let releaseNotes = null;
+    const lastHarness = harness[harness.length - 1];
+    if (lastHarness?.to) {
+      releaseNotes = await fetchReleaseNotes(lastHarness.to).catch(() => null);
+    }
+
+    return {
+      ok: true,
+      since: state.lastAcknowledgedAt,
+      sinceLabel: state.lastAcknowledgedAt ? new Date(sinceMs).toLocaleString('zh-CN') : '（首次使用，展示全部记录）',
+      now: new Date().toISOString(),
+      hasChanges: events.length > 0,
+      plugins,
+      harness,
+      problems,
+      releaseNotes,
+      counts: { plugins: plugins.length, harness: harness.length, problems: problems.length },
+    };
+  }
+
+  /** 抓取某个版本的功能摘要（GitHub Release note 的中文部分，截断到要点） */
+  async function fetchReleaseNotes(version) {
+    const token = process.env.GITHUB_TOKEN || '';
+    const url = `https://api.github.com/repos/deepseek-ai/deepseek-harness/releases/tags/dsh-v${version}`;
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(8000),
+      headers: { accept: 'application/vnd.github+json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const body = String(data?.body ?? '');
+    // 只提取中文段落里的三级标题与一级列表项，去掉英文重复部分
+    const zhPart = body.split(/<h3 id="en-/)[0] ?? body;
+    const lines = zhPart.split('\n')
+      .filter((l) => /^#{1,4}\s|<h3/.test(l) || /^-\s/.test(l))
+      .map((l) => l.replace(/<[^>]+>/g, '').replace(/^#{1,4}\s*/, '').trim())
+      .filter(Boolean);
+    const breaking = lines.filter((l) => /破坏性|不兼容|breaking/i.test(l));
+    return {
+      tag: data?.tag_name ?? null,
+      url: data?.html_url ?? null,
+      publishedAt: data?.published_at ?? null,
+      highlights: lines.slice(0, 25),
+      breaking,
+    };
+  }
+
   async function recentLogs(limit = 50) {
     try {
       const raw = await readFile(historyPath, 'utf8');
@@ -812,6 +905,33 @@ export function apply(ctx, rawConfig = {}) {
 
   if (ctx.webServer?.register) {
     try {
+      // ── 变更汇总（"我离开后你更新了什么"）────────────────────────────────
+      // 数据源：history.jsonl 里 at > lastAcknowledgedAt 的 plugin / harness-applied /
+      // harness-aborted 事件。用户点「知道了」后写入 lastAcknowledgedAt，弹窗消失。
+      const disposeDigest = ctx.webServer.register({
+        kind: 'exact',
+        path: '/api/autoupdater/digest',
+        handler: async (req, res) => {
+          try {
+            if ((req.method || 'GET').toUpperCase() === 'POST') {
+              const body = await readBody(req);
+              const at = body?.at;
+              // 只接受合法时间戳；不允许用户把「已确认」推到未来
+              if (typeof at === 'string' && Number.isFinite(Date.parse(at)) && Date.parse(at) <= Date.now()) {
+                state.lastAcknowledgedAt = at;
+                await saveState();
+              }
+              sendJson(res, 200, { ok: true, lastAcknowledgedAt: state.lastAcknowledgedAt });
+              return;
+            }
+            sendJson(res, 200, await buildDigest());
+          } catch (e) {
+            sendJson(res, 500, { error: String(e?.message ?? e) });
+          }
+        },
+      });
+      if (typeof disposeDigest === 'function') disposers.push(disposeDigest);
+
       const disposeStatus = ctx.webServer.register({
         kind: 'exact',
         path: '/api/autoupdater/status',
