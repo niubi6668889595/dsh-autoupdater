@@ -898,11 +898,14 @@ window.__ModuleLoader__.load({
           id: 'dsh-autoupdater-digest',
           children: { 'autoupdater.digest': { kind: 'chain', scope: 'root' } },
         }, function OverlayHost(props) {
-          // chain 槽必须用 renderSlotChain（框架报错里明确要求的）
-          const render = (props && props.renderSlotChain) || (props && props.renderSlot);
-          if (typeof render === 'function') {
-            return render('autoupdater.digest', {});
+          console.log('[dsh-autoupdater] OverlayHost props keys =',
+            props ? Object.keys(props).join(',') : 'null');
+          console.log('[dsh-autoupdater] renderSlotChain =', typeof (props && props.renderSlotChain));
+          // chain 槽必须用 renderSlotChain（框架报错明确要求）
+          if (props && typeof props.renderSlotChain === 'function') {
+            return props.renderSlotChain('autoupdater.digest', {});
           }
+          // 兜底：直接渲染组件（至少能看到内容）
           return h(DigestHost);
         }));
 
