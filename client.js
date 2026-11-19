@@ -906,10 +906,16 @@ window.__ModuleLoader__.load({
           return null;
         }));
 
-        // 子槽：真正承载弹窗组件
-        ctx.slots.inject('autoupdater.digest', () => ctx.slots.register({
-          name: 'autoupdater.digest',
-        }, DigestHost));
+        // 子槽：真正承载弹窗组件（chain 槽也需要唯一 id）
+        ctx.slots.inject('autoupdater.digest', () => {
+          console.log('[dsh-autoupdater] registering autoupdater.digest child slot');
+          const d = ctx.slots.register({
+            name: 'autoupdater.digest',
+            id: 'dsh-autoupdater-digest-content',
+          }, DigestHost);
+          console.log('[dsh-autoupdater] child slot registered:', typeof d);
+          return d;
+        });
 
         ctx.slots.inject('plugins.item', () => ctx.slots.register({
           name: 'plugins.item',
