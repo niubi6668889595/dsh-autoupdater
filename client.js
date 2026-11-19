@@ -756,11 +756,17 @@ window.__ModuleLoader__.load({
         // shell.overlay 是 kind:'list' 的容器槽 —— 必须用 children 声明真正的组件槽，
         // 并把数据通过 inject 注入（官方 ui-chat 的额度提示就是这么做的）。
         // 直接 register 组件会被当成"容器条目"而永远不渲染。
-        ctx.slots.inject('shell.overlay', () => ctx.slots.register({
-          name: 'shell.overlay',
-          id: 'dsh-autoupdater-digest',
-          children: { 'autoupdater.digest': { kind: 'single', scope: 'root' } },
-        }, DigestHost));
+        ctx.slots.inject('shell.overlay', () => {
+          console.log('[dsh-autoupdater] shell.overlay inject CALLED — registering digest slot');
+          const dispose = ctx.slots.register({
+            name: 'shell.overlay',
+            id: 'dsh-autoupdater-digest',
+            children: { 'autoupdater.digest': { kind: 'single', scope: 'root' } },
+          }, DigestHost);
+          console.log('[dsh-autoupdater] digest slot registered, dispose =', typeof dispose);
+          return dispose;
+        });
+        console.log('[dsh-autoupdater] apply() reached the overlay registration line');
 
         ctx.slots.inject('plugins.item', () => ctx.slots.register({
           name: 'plugins.item',
