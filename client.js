@@ -891,21 +891,19 @@ window.__ModuleLoader__.load({
         // shell.overlay 是 kind:'list' 的容器槽 —— 必须用 children 声明真正的组件槽，
         // 并把数据通过 inject 注入（官方 ui-chat 的额度提示就是这么做的）。
         // 直接 register 组件会被当成"容器条目"而永远不渲染。
-        ctx.slots.inject('shell.overlay', (scope) => {
-          console.log('[dsh-autoupdater] shell.overlay inject CALLED');
-          console.log('[dsh-autoupdater] scope keys =', scope ? Object.keys(scope).join(',') : 'null');
-          try {
-            console.log('[dsh-autoupdater] slots keys =', ctx.slots ? Object.keys(ctx.slots).join(',') : 'no slots');
-          } catch (e) { console.log('[dsh-autoupdater] slots keys err', String(e)); }
-          const dispose = ctx.slots.register({
-            name: 'shell.overlay',
-            id: 'dsh-autoupdater-digest',
-            children: { 'autoupdater.digest': { kind: 'chain', scope: 'root' } },
-          }, DigestHost);
-          console.log('[dsh-autoupdater] digest slot registered, dispose =', typeof dispose);
-          return dispose;
-        });
-        console.log('[dsh-autoupdater] apply() reached the overlay registration line');
+        // 官方 context-menu / ui-chat 的同构写法：条目的组件自己渲染 children 槽，
+        // renderSlot 由框架作为 props 传入（MenuOverlay 就是这样做的）。
+        ctx.slots.inject('shell.overlay', () => ctx.slots.register({
+          name: 'shell.overlay',
+          id: 'dsh-autoupdater-digest',
+          children: { 'autoupdater.digest': { kind: 'chain', scope: 'root' } },
+        }, function OverlayHost(props) {
+          const renderSlot = props && props.renderSlot;
+          if (typeof renderSlot === 'function') {
+            return renderSlot('autoupdater.digest', {});
+          }
+          return h(DigestHost);
+        }));
 
         ctx.slots.inject('plugins.item', () => ctx.slots.register({
           name: 'plugins.item',
