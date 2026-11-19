@@ -592,6 +592,9 @@ window.__ModuleLoader__.load({
         function DigestModal(props) {
           const { digest, onAck } = props;
           const [busy, setBusy] = React.useState(false);
+          // ⚠ 所有 hooks 必须在提前 return 之前——否则 digest 由 null 变有值时
+          // hook 数量变化 → React #310 → "slot entry crashed in shell.overlay"
+          const [expanded, setExpanded] = React.useState(false);
           if (!digest || !digest.hasChanges) return null;
 
           const rowStyle = {
@@ -609,7 +612,6 @@ window.__ModuleLoader__.load({
 
           const allPlugins = digest.plugins || [];
           const COLLAPSED = 8;
-          const [expanded, setExpanded] = React.useState(false);
           const shownPlugins = expanded ? allPlugins : allPlugins.slice(0, COLLAPSED);
           const pluginRows = shownPlugins.map((p) => h('div', { key: `p:${p.name}@${p.to}`, style: rowStyle },
             h('span', { style: { flex: 1, color: T.text, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, p.name),
