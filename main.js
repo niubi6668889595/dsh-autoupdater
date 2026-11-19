@@ -809,7 +809,11 @@ export function apply(ctx, rawConfig = {}) {
    * 打开过但没看等于没看到。
    */
   async function buildDigest() {
-    const sinceMs = state.lastAcknowledgedAt ? Date.parse(state.lastAcknowledgedAt) : 0;
+    // 从未确认过时，只回溯 7 天（否则首次弹窗会倒出两周前的一百多条旧账）
+    const FIRST_RUN_WINDOW_MS = 7 * 24 * 3600 * 1000;
+    const sinceMs = state.lastAcknowledgedAt
+      ? Date.parse(state.lastAcknowledgedAt)
+      : Date.now() - FIRST_RUN_WINDOW_MS;
     const history = await recentLogs(3000);
     // 只看"实际发生了什么"的事件；check 是例行轮询，不进汇总
     const RELEVANT = new Set(['plugin', 'harness-applied', 'harness-rolled-back', 'harness-aborted', 'peer-blocked']);

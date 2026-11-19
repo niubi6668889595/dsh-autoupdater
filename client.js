@@ -607,7 +607,11 @@ window.__ModuleLoader__.load({
             },
           }, text, count != null ? ` (${count})` : '');
 
-          const pluginRows = (digest.plugins || []).map((p) => h('div', { key: `p:${p.name}@${p.to}`, style: rowStyle },
+          const allPlugins = digest.plugins || [];
+          const COLLAPSED = 8;
+          const [expanded, setExpanded] = React.useState(false);
+          const shownPlugins = expanded ? allPlugins : allPlugins.slice(0, COLLAPSED);
+          const pluginRows = shownPlugins.map((p) => h('div', { key: `p:${p.name}@${p.to}`, style: rowStyle },
             h('span', { style: { flex: 1, color: T.text, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, p.name),
             h('span', { style: verStyle }, `${p.from ?? '?'} → ${p.to ?? '?'}`),
             h('span', { style: { color: p.ok ? T.success : T.error, fontSize: 12, flex: 'none' } }, p.ok ? '✓' : '✗'),
@@ -681,8 +685,16 @@ window.__ModuleLoader__.load({
               harnessRows.length ? sectionTitle('DSH 本体', harnessRows.length) : null,
               harnessRows,
               noteBlock,
-              pluginRows.length ? sectionTitle('插件', pluginRows.length) : null,
+              pluginRows.length ? sectionTitle('插件', allPlugins.length) : null,
               pluginRows,
+              allPlugins.length > COLLAPSED ? h('button', {
+                type: 'button',
+                onClick: () => setExpanded((v) => !v),
+                style: {
+                  marginTop: 6, background: 'none', border: 'none', padding: 0,
+                  color: T.brand, fontSize: 12.5, cursor: 'pointer',
+                },
+              }, expanded ? '收起' : `展开全部 ${allPlugins.length} 项`) : null,
               problemRows.length ? sectionTitle('需要注意', problemRows.length) : null,
               problemRows,
             ),
