@@ -898,10 +898,11 @@ window.__ModuleLoader__.load({
         ctx.slots.inject('shell.overlay', () => ctx.slots.register({
           name: 'shell.overlay',
           id: 'dsh-autoupdater-digest',
-          children: { 'autoupdater.digest': { kind: 'chain', scope: 'root' } },
+          children: { 'autoupdater.digest': { kind: 'single', scope: 'root' } },
         }, function OverlayHost(props) {
-          if (props && typeof props.renderSlotChain === 'function') {
-            return props.renderSlotChain('autoupdater.digest', {});
+          // single 槽用 renderSlot
+          if (props && typeof props.renderSlot === 'function') {
+            return props.renderSlot('autoupdater.digest', {});
           }
           return null;
         }));
