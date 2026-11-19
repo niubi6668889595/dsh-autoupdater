@@ -761,7 +761,7 @@ window.__ModuleLoader__.load({
           const dispose = ctx.slots.register({
             name: 'shell.overlay',
             id: 'dsh-autoupdater-digest',
-            children: { 'autoupdater.digest': { kind: 'single', scope: 'root' } },
+            children: { 'autoupdater.digest': { kind: 'chain', scope: 'root' } },
           }, DigestHost);
           console.log('[dsh-autoupdater] digest slot registered, dispose =', typeof dispose);
           return dispose;
