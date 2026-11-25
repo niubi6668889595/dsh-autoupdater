@@ -309,8 +309,13 @@ window.__ModuleLoader__.load({
           return { tone: 'warn', text: `DSH 本体重启更新：→ ${entry.to ?? '?'}` };
         case 'harness-applied':
           return { tone: entry.applied ? 'ok' : 'error', text: `本体更新落盘：${entry.from ?? '?'} → ${entry.applied ?? entry.to ?? '失败'}` };
+        case 'restart-scheduled':
         case 'manual-restart-scheduled':
-          return { tone: 'warn', text: `手动检查触发重启（10 秒后）` };
+          // 2026-11-25 起定时轮也重启（旧 kind 保留兼容历史记录）
+          return {
+            tone: 'warn',
+            text: `插件已安装，10 秒后重启生效（${entry.trigger === 'manual' ? '手动检查' : '定时轮'}）`,
+          };
         case 'error':
           return { tone: 'error', text: `出错：${entry.message ?? entry.raw ?? '?'}` };
         default:

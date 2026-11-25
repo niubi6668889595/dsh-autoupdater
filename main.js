@@ -709,18 +709,27 @@ export function apply(ctx, rawConfig = {}) {
       await appendHistory({ kind: 'check', trigger, findings: report });
       log('check done:', report.length ? report : 'no updates');
 
-      // 立即检查且本轮有实际更新动作 → 延时 10 秒重启 DSH，
-      // 让 restart-required 的新插件与本体重启一并生效。
+      // 本轮有实际更新动作（手动或定时）→ 延时 10 秒重启 DSH，
+      // 让 restart-required 的新插件生效。
       const applied = report.filter((line) =>
         typeof line === 'string' && (/\(auto\)$/.test(line) || /\(staged\)$/.test(line)) && !/跳过/.test(line));
-      // 手动检查的"10 秒后重启"只适用于纯插件更新（无需 npm install）。
-      // 本体更新必须走 staged → 宽限期 → 安装并校验 → 重启，绝不能 10 秒就杀进程
-      // （2026-10-18 事故：10 秒重启抢在 npm install 之前，服务空停 61 分钟）。
+      // 纯插件更新后必须重启才生效 —— 定时轮同样要重启。
+      //
+      // 2026-11-25 修正：旧代码只在 trigger === 'manual' 时重启，导致定时轮
+      // （daily/everyHours）把插件装进磁盘却从不重启，新版本永远停在
+      // "restart-required" 状态，直到用户自己手动重启 —— 等于自动更新没做完。
+      // 定时轮本就跑在 waitIdle 之后的空闲窗口（无人使用），此时重启是安全的。
+      //
+      // 本体更新仍然例外：必须走 staged → 宽限期 → 安装并校验 → 重启，
+      // 绝不能 10 秒就杀进程（2026-10-18 事故：10 秒重启抢在 npm install
+      // 之前，服务空停 61 分钟）。
       const hadHarnessStage = applied.some((l) => /\(staged\)$/.test(l));
       const pluginOnly = applied.filter((l) => !/\(staged\)$/.test(l));
-      if (trigger === 'manual' && pluginOnly.length > 0 && !hadHarnessStage) {
-        log(`plugin updates applied (${pluginOnly.length}), restart DSH in 10s`);
-        await appendHistory({ kind: 'manual-restart-scheduled', updates: pluginOnly, inSeconds: 10 });
+      if (pluginOnly.length > 0 && !hadHarnessStage) {
+        log(`plugin updates applied (${pluginOnly.length}) [${trigger}], restart DSH in 10s`);
+        await appendHistory({
+          kind: 'restart-scheduled', trigger, updates: pluginOnly, inSeconds: 10,
+        });
         await sleep(10000);
         await applyHarnessUpdateNow();
         return;
